@@ -1546,6 +1546,9 @@ class HTTPEnvServer:
                         "Session environment not initialized for MCP websocket"
                     )
 
+                # The socket owns idle expiry; never reap it during a tool call.
+                self._session_websocket_attachments.add(session_id)
+
                 # If environment has an mcp_session context manager, hold it open
                 # for the lifetime of the websocket connection
 
@@ -1559,7 +1562,10 @@ class HTTPEnvServer:
 
                     while True:
                         # Receive message from client
-                        raw_message = await websocket.receive_text()
+                        raw_message = await asyncio.wait_for(
+                            websocket.receive_text(),
+                            timeout=self._session_idle_timeout_s,
+                        )
 
                         try:
                             jsonrpc_dict = json.loads(raw_message)
@@ -1595,7 +1601,7 @@ class HTTPEnvServer:
                             )
                             await websocket.send_text(error_resp.model_dump_json())
 
-            except WebSocketDisconnect:
+            except (WebSocketDisconnect, asyncio.TimeoutError):
                 pass
             except SessionCapacityError as e:
                 error_resp = JsonRpcResponse.error_response(
@@ -1622,6 +1628,7 @@ class HTTPEnvServer:
                 await websocket.send_text(error_resp.model_dump_json())
             finally:
                 if session_id:
+                    self._session_websocket_attachments.discard(session_id)
                     await self._destroy_session(session_id)
                 try:
                     await websocket.close()
@@ -1921,6 +1928,8 @@ all schema information needed to interact with the environment.
                 else:
                     session_id, session_env = await self._create_session(mode=mode)
                     owns_session = True
+                    # Let this handler expire idle reads, never an in-flight action.
+                    self._session_websocket_attachments.add(session_id)
 
                 if session_env is None:
                     raise RuntimeError(
@@ -1940,7 +1949,12 @@ all schema information needed to interact with the environment.
 
                     while True:
                         # Receive message from client
-                        raw_message = await websocket.receive_text()
+                        raw_message = await asyncio.wait_for(
+                            websocket.receive_text(),
+                            timeout=self._session_idle_timeout_s
+                            if owns_session
+                            else None,
+                        )
 
                         try:
                             message_dict = json.loads(raw_message)
@@ -2184,7 +2198,7 @@ all schema information needed to interact with the environment.
                             )
                             await websocket.send_text(error_resp.model_dump_json())
 
-            except WebSocketDisconnect:
+            except (WebSocketDisconnect, asyncio.TimeoutError):
                 pass
             except SessionCapacityError as e:
                 error_resp = WSErrorResponse(
@@ -2219,6 +2233,7 @@ all schema information needed to interact with the environment.
                     if session_id in self._session_pending_closes:
                         await asyncio.shield(self._destroy_session(session_id))
                 elif owns_session and session_id:
+                    self._session_websocket_attachments.discard(session_id)
                     await self._destroy_session(session_id)
                 try:
                     await websocket.close()
